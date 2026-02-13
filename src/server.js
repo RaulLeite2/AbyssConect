@@ -4,6 +4,8 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
+const bcrypt = require('bcryptjs');
+const { pool, initializeDatabase } = require('./database');
 
 const app = express();
 const server = http.createServer(app);
@@ -19,11 +21,11 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-// Estado do servidor
+// Estado do servidor (em memória para performance real-time)
 const users = new Map();          // socketId -> userData
 const voiceRooms = new Map();     // roomId -> { name, users: Set<socketId>, limit }
-const conversations = new Map();  // odels -> messages[]
-const streams = new Map();        // odels -> streamData
+const conversations = new Map();  // conversationId -> messages[]
+const streams = new Map();        // streamId -> streamData
 
 // Salas padrão
 voiceRooms.set('general', { name: 'Sala Geral', users: new Set(), limit: 0 });
@@ -61,6 +63,136 @@ app.get('/stats', (req, res) => {
         activeConversations: conversations.size,
         activeStreams: streams.size
     });
+});
+
+// ============================================
+// Autenticação e Usuários
+// ============================================
+
+app.post('/api/register', async (req, res) => {
+    try {
+        const { username, email, password } = req.body;
+
+        if (!username || !email || !password) {
+            return res.status(400).json({ error: 'Campos obrigatórios' });
+        }
+
+        const passwordHash = await bcrypt.hash(password, 10);
+
+        const result = await pool.query(
+            'INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username, email',
+            [username, email, passwordHash]
+        );
+
+        res.status(201).json({ user: result.rows[0] });
+    } catch (error) {
+        console.error('[API] Erro de registro:', error);
+        res.status(500).json({ error: 'Erro ao registrar' });
+    }
+});
+
+app.post('/api/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+
+        const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+
+        if (result.rows.length === 0) {
+            return res.status(401).json({ error: 'Credenciais inválidas' });
+        }
+
+        const user = result.rows[0];
+        const isValidPassword = await bcrypt.compare(password, user.password_hash);
+
+        if (!isValidPassword) {
+            return res.status(401).json({ error: 'Credenciais inválidas' });
+        }
+
+        res.json({
+            user: {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+                avatar: user.avatar
+            }
+        });
+    } catch (error) {
+        console.error('[API] Erro de login:', error);
+        res.status(500).json({ error: 'Erro ao fazer login' });
+    }
+});
+
+// ============================================
+// Servidores
+// ============================================
+
+app.get('/api/servers/:userId', async (req, res) => {
+    try {
+        const { userId } = req.params;
+
+        const result = await pool.query(`
+            SELECT s.* FROM servers s
+            INNER JOIN server_members sm ON s.id = sm.server_id
+            WHERE sm.user_id = $1
+            ORDER BY s.created_at DESC
+        `, [userId]);
+
+        res.json({ servers: result.rows });
+    } catch (error) {
+        console.error('[API] Erro ao buscar servidores:', error);
+        res.status(500).json({ error: 'Erro ao buscar servidores' });
+    }
+});
+
+app.post('/api/servers', async (req, res) => {
+    try {
+        const { name, ownerId, description, icon } = req.body;
+
+        if (!name || !ownerId) {
+            return res.status(400).json({ error: 'Nome e proprietário obrigatórios' });
+        }
+
+        const serverResult = await pool.query(
+            'INSERT INTO servers (name, owner_id, description, icon) VALUES ($1, $2, $3, $4) RETURNING *',
+            [name, ownerId, description, icon]
+        );
+
+        const serverId = serverResult.rows[0].id;
+
+        // Adicionar owner como membro
+        await pool.query(
+            'INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, $3)',
+            [serverId, ownerId, 'owner']
+        );
+
+        // Criar canal padrão
+        await pool.query(
+            'INSERT INTO channels (server_id, name, type) VALUES ($1, $2, $3)',
+            [serverId, 'geral', 'text']
+        );
+
+        res.status(201).json({ server: serverResult.rows[0] });
+    } catch (error) {
+        console.error('[API] Erro ao criar servidor:', error);
+        res.status(500).json({ error: 'Erro ao criar servidor' });
+    }
+});
+
+app.post('/api/servers/:serverId/invite', async (req, res) => {
+    try {
+        const { serverId } = req.params;
+        const { userId } = req.body;
+
+        await pool.query(
+            'INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, $3)',
+            [serverId, userId, 'member']
+        );
+
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[API] Erro ao convidar:', error);
+        res.status(500).json({ error: 'Erro ao convidar usuário' });
+    }
 });
 
 // ============================================
@@ -113,10 +245,11 @@ io.on('connection', (socket) => {
     });
 
     // ----------------------------------------
-    // Mensagens
+    // ----------------------------------------
+    // Mensagens Diretas
     // ----------------------------------------
 
-    socket.on('message:send', (data) => {
+    socket.on('dm:send', (data) => {
         const { to, text, type = 'text', audioData } = data;
         const sender = users.get(socket.id);
         
@@ -132,7 +265,7 @@ io.on('connection', (socket) => {
             timestamp: new Date().toISOString()
         };
 
-        // Salva na conversa
+        //Salva na conversa
         const convId = [socket.id, to].sort().join('-');
         if (!conversations.has(convId)) {
             conversations.set(convId, []);
@@ -140,28 +273,122 @@ io.on('connection', (socket) => {
         conversations.get(convId).push(message);
 
         // Envia para o destinatário
-        io.to(to).emit('message:receive', message);
+        io.to(to).emit('dm:receive', message);
+        socket.emit('dm:sent', message);
         
-        // Confirma envio para o remetente
-        socket.emit('message:sent', message);
-        
-        console.log(`[MSG] ${sender?.name} -> ${to}: ${type === 'audio' ? '[Áudio]' : text}`);
+        console.log(`[DM] ${sender?.name} -> ${to}: ${type === 'audio' ? '[Áudio]' : text}`);
     });
 
-    socket.on('message:typing', (data) => {
+    socket.on('dm:typing', (data) => {
         const { to } = data;
         const user = users.get(socket.id);
-        io.to(to).emit('message:typing', {
+        io.to(to).emit('dm:typing', {
             from: socket.id,
             name: user?.name
         });
     });
 
-    socket.on('messages:history', (data) => {
+    socket.on('dm:history', (data) => {
         const { with: otherId } = data;
         const convId = [socket.id, otherId].sort().join('-');
         const messages = conversations.get(convId) || [];
-        socket.emit('messages:history', messages);
+        socket.emit('dm:history', messages);
+    });
+
+    // ----------------------------------------
+    // Servidores
+    // ----------------------------------------
+
+    socket.on('server:create', async (data) => {
+        try {
+            const { name, description } = data;
+            const user = users.get(socket.id);
+
+            const result = await pool.query(
+                'INSERT INTO servers (name, owner_id, description) VALUES ($1, $2, $3) RETURNING *',
+                [name, user?.userId, description]
+            );
+
+            const serverId = result.rows[0].id;
+
+            // Adicionar owner como membro
+            await pool.query(
+                'INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, $3)',
+                [serverId, user?.userId, 'owner']
+            );
+
+            // Criar canal padrão
+            await pool.query(
+                'INSERT INTO channels (server_id, name, type) VALUES ($1, $2, $3)',
+                [serverId, 'geral', 'text']
+            );
+
+            const server = {
+                id: serverId,
+                name: result.rows[0].name,
+                ownerId: user?.userId,
+                ownerName: user?.name,
+                members: 1
+            };
+
+            socket.emit('server:created', server);
+            io.emit('server:new', server);
+
+            console.log(`[SERVER] ${user?.name} criou servidor: ${name}`);
+        } catch (error) {
+            console.error('[SERVER] Erro ao criar:', error);
+            socket.emit('server:error', { message: 'Erro ao criar servidor' });
+        }
+    });
+
+    socket.on('server:join', async (data) => {
+        try {
+            const { serverId } = data;
+            const user = users.get(socket.id);
+
+            // Verificar se já é membro
+            const checkResult = await pool.query(
+                'SELECT * FROM server_members WHERE server_id = $1 AND user_id = $2',
+                [serverId, user?.userId]
+            );
+
+            if (checkResult.rows.length > 0) {
+                socket.emit('server:joined', { serverId });
+                return;
+            }
+
+            // Adicionar como membro
+            await pool.query(
+                'INSERT INTO server_members (server_id, user_id, role) VALUES ($1, $2, $3)',
+                [serverId, user?.userId, 'member']
+            );
+
+            socket.emit('server:joined', { serverId });
+            io.emit('server:member-joined', { serverId, userId: user?.userId, userName: user?.name });
+
+            console.log(`[SERVER] ${user?.name} entrou no servidor: ${serverId}`);
+        } catch (error) {
+            console.error('[SERVER] Erro ao entrar:', error);
+            socket.emit('server:error', { message: 'Erro ao entrar no servidor' });
+        }
+    });
+
+    socket.on('server:list', async (data) => {
+        try {
+            const { userId } = data;
+            const result = await pool.query(`
+                SELECT s.*, COUNT(sm.id) as members FROM servers s
+                LEFT JOIN server_members sm ON s.id = sm.server_id
+                WHERE EXISTS (
+                    SELECT 1 FROM server_members WHERE server_id = s.id AND user_id = $1
+                )
+                GROUP BY s.id
+            `, [userId]);
+
+            socket.emit('server:list', { servers: result.rows });
+        } catch (error) {
+            console.error('[SERVER] Erro ao listar:', error);
+        }
     });
 
     // ----------------------------------------
@@ -443,14 +670,25 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, () => {
-    console.log('');
-    console.log('============================================');
-    console.log('     ABYSS CONNECT SERVER');
-    console.log('     The Abyss Team');
-    console.log('============================================');
-    console.log(`Servidor rodando na porta ${PORT}`);
-    console.log(`Ambiente: ${process.env.NODE_ENV || 'development'}`);
-    console.log('============================================');
-    console.log('');
-});
+async function startServer() {
+    try {
+        await initializeDatabase();
+        
+        server.listen(PORT, () => {
+            console.log('');
+            console.log('============================================');
+            console.log('     ABYSS CONNECT SERVER');
+            console.log('     The Abyss Team');
+            console.log('============================================');
+            console.log(`Servidor rodando na porta ${PORT}`);
+            console.log(`Ambiente: ${process.env.NODE_ENV || 'development'}`);
+            console.log('============================================');
+            console.log('');
+        });
+    } catch (error) {
+        console.error('Erro ao iniciar servidor:', error);
+        process.exit(1);
+    }
+}
+
+startServer();
